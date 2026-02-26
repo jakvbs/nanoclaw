@@ -441,6 +441,10 @@ function recoverPendingMessages(): void {
 }
 
 function ensureContainerSystemRunning(): void {
+  if (process.env.AGENT_LOCAL_MODE === '1') {
+    logger.info('Local agent mode enabled, skipping Docker checks');
+    return;
+  }
   ensureContainerRuntimeRunning();
   cleanupOrphans();
 }

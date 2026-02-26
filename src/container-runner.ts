@@ -249,12 +249,244 @@ function buildContainerArgs(
   return args;
 }
 
+/**
+ * Local mode: run agent-runner directly via npx tsx (no Docker).
+ * Reuses buildVolumeMounts() to compute host paths, then passes them
+ * as env vars that agent-runner reads instead of /workspace/* defaults.
+ */
+async function runLocalAgent(
+  group: RegisteredGroup,
+  input: ContainerInput,
+  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onOutput?: (output: ContainerOutput) => Promise<void>,
+): Promise<ContainerOutput> {
+  const startTime = Date.now();
+
+  const groupDir = resolveGroupFolderPath(group.folder);
+  fs.mkdirSync(groupDir, { recursive: true });
+
+  // Reuse mount builder to get the same host paths as container mode
+  const mounts = buildVolumeMounts(group, input.isMain);
+  const mountMap = new Map(mounts.map((m) => [m.containerPath, m.hostPath]));
+
+  const groupPath = mountMap.get('/workspace/group') || groupDir;
+  const globalPath = mountMap.get('/workspace/global') || path.join(GROUPS_DIR, 'global');
+  const ipcPath = mountMap.get('/workspace/ipc') || resolveGroupIpcPath(group.folder);
+  const homePath = mountMap.get('/home/node/.claude') || path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+
+  // Extra mounts: collect all /workspace/extra/* paths
+  const extraPaths: string[] = [];
+  for (const [containerMountPath, hostMountPath] of mountMap) {
+    if (containerMountPath.startsWith('/workspace/extra/')) {
+      extraPaths.push(hostMountPath);
+    }
+  }
+  // In local mode, extra dirs are passed via a colon-separated env var.
+  // If no extra mounts, use a non-existent path so agent-runner's
+  // fs.existsSync check skips it cleanly.
+  const extraDir = extraPaths.length > 0 ? extraPaths[0] : '';
+
+  const localName = `local-${group.folder}-${Date.now()}`;
+
+  logger.info(
+    {
+      group: group.name,
+      localName,
+      groupPath,
+      ipcPath,
+      isMain: input.isMain,
+    },
+    'Spawning local agent',
+  );
+
+  const logsDir = path.join(groupDir, 'logs');
+  fs.mkdirSync(logsDir, { recursive: true });
+
+  const secrets = readSecrets();
+  const agentRunnerEntry = path.join(process.cwd(), 'container', 'agent-runner', 'src', 'index.ts');
+
+  return new Promise((resolve) => {
+    const proc = spawn('npx', ['tsx', agentRunnerEntry], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        // Path overrides for agent-runner
+        NANOCLAW_WORKSPACE_GROUP: groupPath,
+        NANOCLAW_WORKSPACE_GLOBAL: globalPath,
+        NANOCLAW_IPC_DIR: ipcPath,
+        NANOCLAW_EXTRA_DIR: extraDir,
+        // Claude sessions dir
+        HOME: path.dirname(homePath), // parent of .claude so HOME/.claude resolves
+        TZ: TIMEZONE,
+        // SDK needs auth in env (agent-runner's sdkEnv merge handles this,
+        // but the SDK process inherits env at startup)
+        ...secrets,
+      },
+    });
+
+    onProcess(proc, localName);
+
+    // Pass input via stdin (same protocol as container mode)
+    input.mcpServers = readMcpConfig();
+    input.secrets = secrets;
+    proc.stdin!.write(JSON.stringify(input));
+    proc.stdin!.end();
+    delete input.secrets;
+    delete input.mcpServers;
+
+    let stdout = '';
+    let stderr = '';
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+
+    let parseBuffer = '';
+    let newSessionId: string | undefined;
+    let outputChain = Promise.resolve();
+    let hadStreamingOutput = false;
+    let timedOut = false;
+
+    const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+
+    const killOnTimeout = () => {
+      timedOut = true;
+      logger.error(
+        { group: group.name, localName },
+        'Local agent timeout, sending SIGTERM',
+      );
+      proc.kill('SIGTERM');
+      setTimeout(() => {
+        if (!proc.killed) {
+          logger.warn({ group: group.name, localName }, 'SIGTERM timeout, sending SIGKILL');
+          proc.kill('SIGKILL');
+        }
+      }, 15_000);
+    };
+
+    let timeout = setTimeout(killOnTimeout, timeoutMs);
+
+    const resetTimeout = () => {
+      clearTimeout(timeout);
+      timeout = setTimeout(killOnTimeout, timeoutMs);
+    };
+
+    proc.stdout!.on('data', (data) => {
+      const chunk = data.toString();
+      if (!stdoutTruncated) {
+        const remaining = CONTAINER_MAX_OUTPUT_SIZE - stdout.length;
+        if (chunk.length > remaining) {
+          stdout += chunk.slice(0, remaining);
+          stdoutTruncated = true;
+        } else {
+          stdout += chunk;
+        }
+      }
+
+      if (onOutput) {
+        parseBuffer += chunk;
+        let startIdx: number;
+        while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
+          const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
+          if (endIdx === -1) break;
+          const jsonStr = parseBuffer
+            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+            .trim();
+          parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
+          try {
+            const parsed: ContainerOutput = JSON.parse(jsonStr);
+            if (parsed.newSessionId) newSessionId = parsed.newSessionId;
+            hadStreamingOutput = true;
+            resetTimeout();
+            outputChain = outputChain.then(() => onOutput(parsed));
+          } catch (err) {
+            logger.warn({ group: group.name, error: err }, 'Failed to parse streamed output chunk');
+          }
+        }
+      }
+    });
+
+    proc.stderr!.on('data', (data) => {
+      const chunk = data.toString();
+      const lines = chunk.trim().split('\n');
+      for (const line of lines) {
+        if (line) logger.debug({ agent: group.folder }, line);
+      }
+      if (stderrTruncated) return;
+      const remaining = CONTAINER_MAX_OUTPUT_SIZE - stderr.length;
+      if (chunk.length > remaining) {
+        stderr += chunk.slice(0, remaining);
+        stderrTruncated = true;
+      } else {
+        stderr += chunk;
+      }
+    });
+
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+      const duration = Date.now() - startTime;
+
+      if (timedOut) {
+        if (hadStreamingOutput) {
+          logger.info({ group: group.name, localName, duration, code }, 'Local agent timed out after output (idle cleanup)');
+          outputChain.then(() => resolve({ status: 'success', result: null, newSessionId }));
+          return;
+        }
+        resolve({ status: 'error', result: null, error: `Local agent timed out after ${configTimeout}ms` });
+        return;
+      }
+
+      if (code !== 0) {
+        logger.error({ group: group.name, code, duration, stderr: stderr.slice(-500) }, 'Local agent exited with error');
+        resolve({ status: 'error', result: null, error: `Local agent exited with code ${code}: ${stderr.slice(-200)}` });
+        return;
+      }
+
+      if (onOutput) {
+        outputChain.then(() => {
+          logger.info({ group: group.name, duration, newSessionId }, 'Local agent completed (streaming mode)');
+          resolve({ status: 'success', result: null, newSessionId });
+        });
+        return;
+      }
+
+      // Legacy: parse last output marker pair
+      try {
+        const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
+        const endIdx = stdout.indexOf(OUTPUT_END_MARKER);
+        let jsonLine: string;
+        if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+          jsonLine = stdout.slice(startIdx + OUTPUT_START_MARKER.length, endIdx).trim();
+        } else {
+          const lines = stdout.trim().split('\n');
+          jsonLine = lines[lines.length - 1];
+        }
+        const output: ContainerOutput = JSON.parse(jsonLine);
+        logger.info({ group: group.name, duration, status: output.status }, 'Local agent completed');
+        resolve(output);
+      } catch (err) {
+        logger.error({ group: group.name, stdout, stderr, error: err }, 'Failed to parse local agent output');
+        resolve({ status: 'error', result: null, error: `Failed to parse output: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timeout);
+      logger.error({ group: group.name, localName, error: err }, 'Local agent spawn error');
+      resolve({ status: 'error', result: null, error: `Local agent spawn error: ${err.message}` });
+    });
+  });
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
+  if (process.env.AGENT_LOCAL_MODE === '1') {
+    return runLocalAgent(group, input, onProcess, onOutput);
+  }
+
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);
