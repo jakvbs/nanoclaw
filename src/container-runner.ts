@@ -435,7 +435,7 @@ async function runLocalAgent(
       const chunk = data.toString();
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
-        if (line) logger.debug({ agent: group.folder }, line);
+        if (line) logger.info({ agent: group.folder }, line);
       }
       if (stderrTruncated) return;
       const remaining = CONTAINER_MAX_OUTPUT_SIZE - stderr.length;
