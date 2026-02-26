@@ -539,7 +539,9 @@ async function main(): Promise<void> {
   }
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
+  const mcpJsPath = path.join(__dirname, 'ipc-mcp-stdio.js');
+  const mcpTsPath = path.join(__dirname, 'ipc-mcp-stdio.ts');
+  const mcpServerPath = fs.existsSync(mcpJsPath) ? mcpJsPath : mcpTsPath;
 
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });

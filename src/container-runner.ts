@@ -302,26 +302,52 @@ async function runLocalAgent(
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
-  const secrets = readSecrets();
   const agentRunnerEntry = path.join(process.cwd(), 'container', 'agent-runner', 'src', 'index.ts');
+
+  // In local mode, the SDK's auto-refresh OAuth flow needs ~/.claude/.credentials.json.
+  // Symlink the real credentials into the per-group sessions dir so the SDK finds them
+  // when HOME is overridden.
+  const realCredentials = path.join(process.env.HOME || '/root', '.claude', '.credentials.json');
+  const groupCredentials = path.join(homePath, '.credentials.json');
+  if (fs.existsSync(realCredentials) && !fs.existsSync(groupCredentials)) {
+    try {
+      fs.symlinkSync(realCredentials, groupCredentials);
+      logger.debug({ group: group.name }, 'Symlinked credentials to group sessions dir');
+    } catch (err) {
+      logger.warn({ group: group.name, err }, 'Failed to symlink credentials');
+    }
+  }
+
+  // When a credentials file exists, the SDK handles auth via auto-refresh OAuth.
+  // Stale CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY from .env would override this,
+  // so skip .env secrets entirely and clear them from inherited process.env.
+  const hasCredentials = fs.existsSync(groupCredentials);
+  const secrets = hasCredentials ? {} : readSecrets();
+
+  const spawnEnv: Record<string, string | undefined> = {
+    ...process.env,
+    // Path overrides for agent-runner
+    NANOCLAW_WORKSPACE_GROUP: groupPath,
+    NANOCLAW_WORKSPACE_GLOBAL: globalPath,
+    NANOCLAW_IPC_DIR: ipcPath,
+    NANOCLAW_EXTRA_DIR: extraDir,
+    // Claude sessions dir
+    HOME: path.dirname(homePath), // parent of .claude so HOME/.claude resolves
+    TZ: TIMEZONE,
+    ...secrets,
+  };
+
+  // Clear stale auth tokens from inherited env when using credentials file
+  if (hasCredentials) {
+    delete spawnEnv.CLAUDE_CODE_OAUTH_TOKEN;
+    delete spawnEnv.ANTHROPIC_API_KEY;
+    logger.debug({ group: group.name }, 'Using credentials file for auth, cleared env tokens');
+  }
 
   return new Promise((resolve) => {
     const proc = spawn('npx', ['tsx', agentRunnerEntry], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        // Path overrides for agent-runner
-        NANOCLAW_WORKSPACE_GROUP: groupPath,
-        NANOCLAW_WORKSPACE_GLOBAL: globalPath,
-        NANOCLAW_IPC_DIR: ipcPath,
-        NANOCLAW_EXTRA_DIR: extraDir,
-        // Claude sessions dir
-        HOME: path.dirname(homePath), // parent of .claude so HOME/.claude resolves
-        TZ: TIMEZONE,
-        // SDK needs auth in env (agent-runner's sdkEnv merge handles this,
-        // but the SDK process inherits env at startup)
-        ...secrets,
-      },
+      env: spawnEnv,
     });
 
     onProcess(proc, localName);
