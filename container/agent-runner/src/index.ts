@@ -19,6 +19,14 @@ import path from 'path';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
+interface McpServerConfig {
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+}
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -28,6 +36,7 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  mcpServers?: Record<string, McpServerConfig>;
 }
 
 interface ContainerOutput {
@@ -432,13 +441,20 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        // Allow tools from all user-configured MCP servers
+        ...(containerInput.mcpServers
+          ? Object.keys(containerInput.mcpServers).map(name => `mcp__${name}__*`)
+          : []),
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
       mcpServers: {
+        // User-configured MCP servers (from .mcp.json) — spread first so
+        // the built-in nanoclaw server below can never be overridden
+        ...containerInput.mcpServers,
         nanoclaw: {
           command: 'node',
           args: [mcpServerPath],

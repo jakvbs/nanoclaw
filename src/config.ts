@@ -1,3 +1,4 @@
+import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
@@ -62,3 +63,24 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+const MCP_CONFIG_PATH = path.resolve(PROJECT_ROOT, '.mcp.json');
+
+/**
+ * Read user-configured MCP servers from .mcp.json at project root.
+ * Returns undefined if file is missing, invalid, or empty.
+ * Rejects 'nanoclaw' as a user-defined server name to prevent overriding the built-in IPC server.
+ */
+export function readMcpConfig(): Record<string, Record<string, unknown>> | undefined {
+  try {
+    const raw = JSON.parse(fs.readFileSync(MCP_CONFIG_PATH, 'utf-8'));
+    const servers = raw?.mcpServers;
+    if (servers && typeof servers === 'object' && Object.keys(servers).length > 0) {
+      if ('nanoclaw' in servers) {
+        delete servers.nanoclaw;
+      }
+      return Object.keys(servers).length > 0 ? servers : undefined;
+    }
+  } catch { /* file missing or invalid — no user MCP servers */ }
+  return undefined;
+}
