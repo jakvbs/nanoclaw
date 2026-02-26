@@ -521,7 +521,7 @@ async function main(): Promise<void> {
     containerInput = JSON.parse(stdinData);
     // Delete the temp file the entrypoint wrote — it contains secrets
     try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
+    log(`Received input for group: ${containerInput.groupFolder}, mcpServers: ${Object.keys(containerInput.mcpServers || {}).join(', ') || 'none'}`);
   } catch (err) {
     writeOutput({
       status: 'error',
